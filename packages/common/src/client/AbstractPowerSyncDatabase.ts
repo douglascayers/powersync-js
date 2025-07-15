@@ -17,7 +17,6 @@ import { UploadQueueStats } from '../db/crud/UploadQueueStatus.js';
 import { Schema } from '../db/schema/Schema.js';
 import { BaseObserver } from '../utils/BaseObserver.js';
 import { DisposeManager } from '../utils/DisposeManager.js';
-import { mutexRunExclusive } from '../utils/mutex.js';
 import { ConnectionManager } from './ConnectionManager.js';
 import { SQLOpenFactory, SQLOpenOptions, isDBAdapter, isSQLOpenFactory, isSQLOpenOptions } from './SQLOpenFactory.js';
 import { PowerSyncBackendConnector } from './connection/PowerSyncBackendConnector.js';
@@ -29,6 +28,7 @@ import { CrudTransaction } from './sync/bucket/CrudTransaction.js';
 import {
   DEFAULT_CRUD_UPLOAD_THROTTLE_MS,
   DEFAULT_RETRY_DELAY_MS,
+  InternalConnectionOptions,
   StreamingSyncImplementation,
   StreamingSyncImplementationListener,
   type AdditionalConnectionOptions,
@@ -152,12 +152,6 @@ export const isPowerSyncDatabaseOptionsWithSettings = (test: any): test is Power
 };
 
 export abstract class AbstractPowerSyncDatabase extends BaseObserver<PowerSyncDBListener> {
-  /**
-   * Transactions should be queued in the DBAdapter, but we also want to prevent
-   * calls to `.execute` while an async transaction is running.
-   */
-  protected static transactionMutex: Mutex = new Mutex();
-
   /**
    * Returns true if the connection is closed.
    */
@@ -472,7 +466,10 @@ export abstract class AbstractPowerSyncDatabase extends BaseObserver<PowerSyncDB
    * Connects to stream of events from the PowerSync instance.
    */
   async connect(connector: PowerSyncBackendConnector, options?: PowerSyncConnectionOptions) {
-    return this.connectionManager.connect(connector, options);
+    const resolvedOptions: InternalConnectionOptions = options ?? {};
+    resolvedOptions.serializedSchema = this.schema.toJSON();
+
+    return this.connectionManager.connect(connector, resolvedOptions);
   }
 
   /**
@@ -681,8 +678,7 @@ export abstract class AbstractPowerSyncDatabase extends BaseObserver<PowerSyncDB
    * @returns The query result as an object with structured key-value pairs
    */
   async execute(sql: string, parameters?: any[]) {
-    await this.waitForReady();
-    return this.database.execute(sql, parameters);
+    return this.writeLock((tx) => tx.execute(sql, parameters));
   }
 
   /**
@@ -756,7 +752,7 @@ export abstract class AbstractPowerSyncDatabase extends BaseObserver<PowerSyncDB
    */
   async readLock<T>(callback: (db: DBAdapter) => Promise<T>) {
     await this.waitForReady();
-    return mutexRunExclusive(AbstractPowerSyncDatabase.transactionMutex, () => callback(this.database));
+    return this.database.readLock(callback);
   }
 
   /**
@@ -765,10 +761,7 @@ export abstract class AbstractPowerSyncDatabase extends BaseObserver<PowerSyncDB
    */
   async writeLock<T>(callback: (db: DBAdapter) => Promise<T>) {
     await this.waitForReady();
-    return mutexRunExclusive(AbstractPowerSyncDatabase.transactionMutex, async () => {
-      const res = await callback(this.database);
-      return res;
-    });
+    return this.database.writeLock(callback);
   }
 
   /**
